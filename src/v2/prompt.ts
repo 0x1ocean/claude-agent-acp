@@ -13,7 +13,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
-import type { StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
+import type { CycleEvents, StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
 
 /**
  * Starts a turn for `params`, and answers when Claude Code takes the prompt
@@ -45,6 +45,7 @@ export function v2Prompt(
   send: (update: v2.SessionUpdate) => void,
 ): Promise<v2.PromptResponse> {
   return new Promise((resolve, reject) => {
+    const work = foregroundWork(send);
     let inserted = false;
     const events: TurnEvents = {
       inserted(messageId) {
@@ -53,15 +54,11 @@ export function v2Prompt(
         send({ sessionUpdate: "state_update", state: "running" });
         resolve({ messageId });
       },
-      awaitingUser() {
-        send({ sessionUpdate: "state_update", state: "requires_action" });
-      },
-      resumed() {
-        send({ sessionUpdate: "state_update", state: "running" });
-      },
+      awaitingUser: work.awaitingUser,
+      resumed: work.resumed,
       ended(outcome) {
         if (inserted) {
-          send(idle(outcome));
+          work.ended(outcome);
         } else if (outcome.stopReason === "cancelled") {
           reject(RequestError.requestCancelled());
         } else {
@@ -74,16 +71,8 @@ export function v2Prompt(
         }
       },
       failed(error) {
-        if (!inserted) {
-          reject(error);
-          return;
-        }
-        send({
-          sessionUpdate: "state_update",
-          state: "idle",
-          stopReason: "error",
-          error: jsonRpcError(error),
-        });
+        if (inserted) work.failed(error);
+        else reject(error);
       },
     };
     let request: PromptRequest;
@@ -95,6 +84,44 @@ export function v2Prompt(
     }
     agent.startTurn(request, events).catch(reject);
   });
+}
+
+/**
+ * Reports a model cycle that Claude Code started on its own while the session
+ * had no turn (see {@link CycleEvents}), such as its follow-up after a
+ * background command finished. v2 reports foreground work whether or not a
+ * prompt started it: `running` now, then the cycle's states as for a prompt's
+ * turn after it was taken in.
+ */
+export function v2AutonomousCycle(send: (update: v2.SessionUpdate) => void): CycleEvents {
+  send({ sessionUpdate: "state_update", state: "running" });
+  return foregroundWork(send);
+}
+
+/**
+ * The states of foreground work once it runs: `requires_action` while it
+ * waits for the user, `running` again after, and `idle` when it ends or fails.
+ */
+function foregroundWork(send: (update: v2.SessionUpdate) => void): CycleEvents {
+  return {
+    awaitingUser() {
+      send({ sessionUpdate: "state_update", state: "requires_action" });
+    },
+    resumed() {
+      send({ sessionUpdate: "state_update", state: "running" });
+    },
+    ended(outcome) {
+      send(idle(outcome));
+    },
+    failed(error) {
+      send({
+        sessionUpdate: "state_update",
+        state: "idle",
+        stopReason: "error",
+        error: jsonRpcError(error),
+      });
+    },
+  };
 }
 
 /** The JSON-RPC error that v1 answers a failed prompt with. */

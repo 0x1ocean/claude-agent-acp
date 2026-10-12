@@ -48,6 +48,16 @@ export interface TurnEvents {
   failed(error: unknown): void;
 }
 
+/**
+ * A model cycle that Claude Code started on its own while the session had no
+ * turn: for example, the model's follow-up after a background command
+ * finished, or its answer to a message from another session. No prompt
+ * started it, so it reports like a turn after {@link TurnEvents.inserted}: it
+ * may wait for the user, and it ends or fails once. A prompt that Claude Code
+ * takes in while it runs takes it over, and the cycle reports nothing more.
+ */
+export type CycleEvents = Omit<TurnEvents, "inserted">;
+
 /** Why a turn ended. Every ACP version has these reasons. */
 export type StopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
 
