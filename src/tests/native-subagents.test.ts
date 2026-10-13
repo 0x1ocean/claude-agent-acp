@@ -1068,6 +1068,88 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(published.some(({ sessionId }) => sessionId === "worker-2")).toBe(false);
   });
 
+  describe("a nested child whose own parent is not announced yet", () => {
+    /** A runtime, the updates it sends in order, and the deliver function of
+     *  the agent, which routes a buffered update again (as `sendUpdate` does). */
+    function setup() {
+      const sent: AcpSessionNotification[] = [];
+      const runtime: NativeSubagentRuntime = new NativeSubagentRuntime(
+        "rfd",
+        "root",
+        {},
+        async (notification) => {
+          sent.push(notification);
+        },
+        { log: () => {} },
+      );
+      const deliver = async (notification: AcpSessionNotification): Promise<void> => {
+        const routed = await runtime.route(notification, deliver);
+        if (routed) sent.push(routed);
+      };
+      return { runtime, sent, deliver };
+    }
+    /** The announcements, as [parent, child], and the sessions that got
+     *  traffic before each was announced. */
+    function check(sent: AcpSessionNotification[]) {
+      const announced = new Set(["root"]);
+      const early: string[] = [];
+      const announcements: [string, string][] = [];
+      for (const { sessionId, update } of sent) {
+        if (!announced.has(sessionId)) early.push(sessionId);
+        if (update.sessionUpdate === "subagent_update" && !announced.has(update.sessionId)) {
+          announced.add(update.sessionId);
+          announcements.push([sessionId, update.sessionId]);
+        }
+      }
+      return { announcements, early };
+    }
+
+    it("announces it after that parent, when the parent's task started before its launch frame", async () => {
+      const { runtime, sent, deliver } = setup();
+      // worker-1 is known, but its launch frame has not come: not announced.
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(launch("launch-2", { description: "Dig" }, "launch-1"));
+      await runtime.taskStarted(
+        { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(launch("launch-1", { description: "Fix the build" }));
+
+      expect(check(sent)).toEqual({
+        announcements: [
+          ["root", "worker-1"],
+          ["worker-1", "worker-2"],
+        ],
+        early: [],
+      });
+    });
+
+    it("never announces it under the root, when its parent is not known yet", async () => {
+      const { runtime, sent, deliver } = setup();
+      await deliver(launch("launch-2", { description: "Dig" }, "launch-1"));
+      await runtime.taskStarted(
+        { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(launch("launch-1", { description: "Fix the build" }));
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+
+      expect(check(sent)).toEqual({
+        announcements: [
+          ["root", "worker-1"],
+          ["worker-1", "worker-2"],
+        ],
+        early: [],
+      });
+    });
+  });
+
   it("keeps the role in the title when a late frame names the child", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(

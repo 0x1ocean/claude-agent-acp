@@ -174,17 +174,28 @@ export class NativeSubagentRuntime {
           mergeSubagentIdentity(this.identityByToolUse.get(toolCallId), identity),
         );
       }
+      const parentChild = claudeMeta?.parentToolUseId
+        ? this.childByParentToolUse.get(claudeMeta.parentToolUseId)
+        : undefined;
       const parentSessionId = claudeMeta?.parentToolUseId
-        ? this.childByParentToolUse.get(claudeMeta.parentToolUseId)?.sessionId
+        ? parentChild?.sessionId
         : this.rootSessionId;
-      this.parentByToolUse.set(toolCallId, parentSessionId ?? this.rootSessionId);
-
+      // The RFD form: a call made inside a child that is not announced yet
+      // establishes no parent, because the RFD forbids announcing its child
+      // under the root or before that child. The update is buffered below
+      // under the child's tool use, and routed again, with the child as the
+      // parent, once the child is announced.
+      const parentPending =
+        this.form === "rfd" && !!claudeMeta?.parentToolUseId && !parentChild?.announced;
       const child = this.childByParentToolUse.get(toolCallId);
-      if (child && !child.announced) {
-        child.parentSessionId = parentSessionId ?? this.rootSessionId;
-        applySubagentIdentity(child, this.identityByToolUse.get(toolCallId));
-        await this.announce(child);
-        for (const pending of this.takePending(toolCallId)) await deliver(pending);
+      if (!parentPending) {
+        this.parentByToolUse.set(toolCallId, parentSessionId ?? this.rootSessionId);
+        if (child && !child.announced) {
+          child.parentSessionId = parentSessionId ?? this.rootSessionId;
+          applySubagentIdentity(child, this.identityByToolUse.get(toolCallId));
+          await this.announce(child);
+          for (const pending of this.takePending(toolCallId)) await deliver(pending);
+        }
       }
       if (this.form === "air") {
         if (!child && isFailedToolCallUpdate(update)) {
