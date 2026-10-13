@@ -484,9 +484,10 @@ export class NativeSubagentRuntime {
   /**
    * The parent session got `session/cancel`. AIR's draft ends every child as
    * cancelled here. The RFD form reports nothing: acknowledging a cancel is no
-   * evidence that a child stopped. The interrupt stops the foreground children
-   * that the turn waits on, which the SDK's task events then report as
-   * cancelled; a background child keeps running, and keeps its open requests
+   * evidence that a child stopped. Claude Code's interrupt stops the
+   * foreground children that the turn waits on and, currently, background
+   * children too, and the SDK's task events report each as cancelled. A child
+   * that keeps running keeps its open requests
    * (agentclientprotocol/agent-client-protocol#2308).
    */
   async parentCancelled(deliver: Publish): Promise<void> {

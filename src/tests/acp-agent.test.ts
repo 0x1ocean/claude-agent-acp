@@ -5656,6 +5656,78 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(childEvents).toEqual(["tool_call pending agent-42", "subagent cancelled"]);
   });
 
+  it("keeps the Agent call's own heartbeat and result on the session that made the call (the subagents RFD)", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        rootToolUse("toolu_parent", "Agent", {
+          subagent_type: "Explore",
+          description: "Investigate",
+          prompt: "Find the parser",
+        }),
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        // A heartbeat of the running Agent call: its own id is synthetic, and
+        // the SDK names the Agent call as `parent_tool_use_id`.
+        {
+          type: "tool_progress",
+          tool_use_id: "toolu_parent-heartbeat-1",
+          tool_name: "Agent",
+          parent_tool_use_id: "toolu_parent",
+          elapsed_time_seconds: 30,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-42",
+          tool_use_id: "toolu_parent",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        {
+          type: "user",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          parent_tool_use_id: null,
+          message: {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "toolu_parent", content: "It is in x.ts." },
+            ],
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const agentCall = updates.flatMap(({ sessionId, update }) =>
+      (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+      update.toolCallId === "toolu_parent"
+        ? [{ sessionId, status: update.status }]
+        : [],
+    );
+    expect(agentCall.map(({ status }) => status)).toEqual(
+      expect.arrayContaining(["in_progress", "completed"]),
+    );
+    expect(new Set(agentCall.map(({ sessionId }) => sessionId))).toEqual(new Set(["test-session"]));
+  });
+
   it("routes a native child AskUserQuestion and its tool call to the child session", async () => {
     const { agent, updates, elicitations, session } = setup();
     await agent.initialize({

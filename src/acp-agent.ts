@@ -7461,13 +7461,18 @@ export class ClaudeAcpAgent {
             if (toolCallId === null || !session.emittedToolCalls.has(toolCallId)) {
               break;
             }
-            const subagentParentToolUseId = message.parent_tool_use_id
-              ? [...session.liveBackgroundTasks.values()].some(
-                  (task) => task.isSubagent && task.parentToolUseId === message.parent_tool_use_id,
-                )
+            // The beat is in the subagent whose Agent call is
+            // `parent_tool_use_id`, unless it reports on that Agent call
+            // itself: the Agent call's own heartbeat falls back to its id, and
+            // a tool call is never its own parent.
+            const subagentParentToolUseId =
+              message.parent_tool_use_id &&
+              message.parent_tool_use_id !== toolCallId &&
+              [...session.liveBackgroundTasks.values()].some(
+                (task) => task.isSubagent && task.parentToolUseId === message.parent_tool_use_id,
+              )
                 ? message.parent_tool_use_id
-                : undefined
-              : undefined;
+                : undefined;
             // `tool_name` names the tool that reports the beat. When the beat
             // falls back to the parent call, AIR gets the name of that call,
             // or no name. Every other client gets `tool_name`, like upstream.
@@ -7717,7 +7722,7 @@ export class ClaudeAcpAgent {
     // callbacks), even when publishing fails. AIR's draft ends every child
     // here, so a later update of an ended child's tool call is then dropped
     // instead of reaching that child's session. The RFD form keeps the state:
-    // a background subagent keeps running after a cancel
+    // a background subagent can keep running after a cancel
     // (agentclientprotocol/agent-client-protocol#2308), and its tool call that
     // a permission request emitted on the root before the child was announced
     // must stay on the root, which the RFD requires. Each tool call drops its
