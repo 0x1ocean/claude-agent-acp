@@ -147,6 +147,30 @@ function lifecycleFrame(commandUuid: string, state: string) {
   };
 }
 
+/** A `system`/init frame with the capabilities CLI 2.1.293 advertises for
+ *  cancellation, including request_marker_lists_v1: each model request then
+ *  lists the prompts it serves (see {@link requesting}). */
+const markersInit = {
+  type: "system",
+  subtype: "init",
+  session_id: "test-session",
+  capabilities: ["interrupt_receipt_v1", "msg_lifecycle_v1", "request_marker_lists_v1"],
+};
+
+/** The `status: requesting` frame that starts a model request serving
+ *  `prompts`. A request that serves none, such as a follow-up that Claude Code
+ *  starts on its own, leaves `user_message_uuids` out. */
+function requesting(...prompts: string[]) {
+  return {
+    type: "system",
+    subtype: "status",
+    status: "requesting",
+    ...(prompts.length > 0 ? { user_message_uuids: prompts } : {}),
+    uuid: randomUUID(),
+    session_id: "test-session",
+  };
+}
+
 /** The `usage` a cancelled active turn settles with when the cancel pre-empted
  *  its result: all zeros, since only a turn's terminal result feeds the
  *  accumulator (issue #844). */
@@ -5603,6 +5627,76 @@ describe("subagent permission attribution (issue #851)", () => {
     };
   }
 
+  it("releases a tool call that ends cancelled on v2, as one that ends failed", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+      { v2: true },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          parent_tool_use_id: null,
+          message: {
+            id: "msg-bash",
+            model: "claude-sonnet-4-5",
+            role: "assistant",
+            type: "message",
+            stop_reason: "tool_use",
+            content: [
+              { type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "make" } },
+            ],
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        },
+        {
+          type: "user",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          parent_tool_use_id: null,
+          // The user interrupted the turn while the command ran.
+          tool_result_meta: [{ id: "toolu_bash", non_execution_kind: "interrupted" }],
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_bash",
+                content: "[Request interrupted by user for tool use]",
+                is_error: true,
+              },
+            ],
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(
+      updates
+        .map(({ update }) => update)
+        .filter(
+          (update) =>
+            update.sessionUpdate === "tool_call_update" && "status" in update && update.status,
+        )
+        .at(-1),
+    ).toMatchObject({ toolCallId: "toolu_bash", status: "cancelled" });
+    // The agent stops tracking the call once it ends, whichever way.
+    expect(agent.sessions["test-session"]?.dispatchedToolCalls?.has("toolu_bash")).toBe(false);
+  });
+
   it("records task_started's task_id → tool_use_id mapping while consuming the stream", async () => {
     const agent = new ClaudeAcpAgent(
       { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
@@ -10916,6 +11010,7 @@ describe("logout", () => {
         "agentFileChangeReport",
         "nativeSubagentSessions",
         "asyncTasks",
+        "customInstructions",
         "recommendedValue",
         "diffPatch",
         "planFile",
@@ -10938,6 +11033,7 @@ describe("logout", () => {
         "agentFileChangeReport",
         "nativeSubagentSessions",
         "asyncTasks",
+        "customInstructions",
         "recommendedValue",
         "diffPatch",
         "planFile",
@@ -10954,9 +11050,114 @@ describe("session/fork", () => {
     vi.mocked(importSessionToStore).mockClear();
   });
 
+  const modes = { currentModeId: "plan", availableModes: [] };
+
+  /** An agent whose sessions start without Claude Code: each one gets a
+   *  scripted query that runs `turn` for every prompt. */
+  function forkingAgent(turn: (prompt: any) => any[] = () => []) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async (n: SessionNotification) => updates.push(n) } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const createSession = vi
+      .spyOn(agent as any, "createSession")
+      .mockImplementation(async (params: any, options: any) => {
+        const sessionId = options.resume as string;
+        const input = new Pushable<any>();
+        async function* answer() {
+          for await (const prompt of input) yield* turn(prompt);
+        }
+        agent.sessions[sessionId] = mockSessionState(
+          {
+            // The commands go to the client after the response.
+            query: Object.assign(wrapQuery(answer()), { supportedCommands: async () => [] }),
+            input,
+            modes,
+            sessionFingerprint: computeSessionFingerprint(params),
+          },
+          agent,
+          sessionId,
+        );
+        return { sessionId, modes, configOptions: [] };
+      });
+    return { agent, updates, createSession };
+  }
+
+  it("starts the forked session, so the client can prompt it at once", async () => {
+    const { agent, updates, createSession } = forkingAgent((prompt) => [
+      userEcho(prompt),
+      {
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "fork-id",
+        message: {
+          id: "msg_fork",
+          role: "assistant",
+          model: "claude-sonnet-4-20250514",
+          content: [{ type: "text", text: "Forked answer" }],
+          usage: {},
+        },
+      },
+      successfulResultMessage({ session_id: "fork-id" }),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "fork-id" },
+    ]);
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+
+    const response = await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: "/workspace",
+      mcpServers: [],
+    });
+
+    // It starts like a resumed session, from the copied transcript.
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: "/workspace", mcpServers: [] }),
+      expect.objectContaining({ resume: "fork-id" }),
+    );
+    expect(response).toEqual({ sessionId: "fork-id", modes, configOptions: [] });
+    await expect(
+      agent.prompt({ sessionId: "fork-id", prompt: [{ type: "text", text: "go on" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        sessionId: "fork-id",
+        update: expect.objectContaining({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Forked answer" },
+        }),
+      }),
+    );
+  });
+
+  it("reuses the forked session for a later resume or load with the same settings", async () => {
+    const { agent, createSession } = forkingAgent();
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+    const settings = { cwd: "/workspace", mcpServers: [] };
+    await agent.unstable_forkSession({ sessionId: "source-id", ...settings });
+    const forked = agent.sessions["fork-id"];
+
+    await agent.resumeSession({ sessionId: "fork-id", ...settings });
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([]);
+    await agent.loadSession({ sessionId: "fork-id", ...settings });
+
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(agent.sessions["fork-id"]).toBe(forked);
+  });
+
+  it("fails when the forked session cannot start", async () => {
+    const { agent, createSession } = forkingAgent();
+    createSession.mockRejectedValueOnce(new Error("Claude Code did not start"));
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+
+    await expect(
+      agent.unstable_forkSession({ sessionId: "source-id", cwd: "/workspace", mcpServers: [] }),
+    ).rejects.toThrow("Claude Code did not start");
+  });
+
   it("forks the latest turn in the requested workspace", async () => {
-    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const { agent, createSession } = forkingAgent();
     vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
 
     const response = await agent.unstable_forkSession({
@@ -10968,11 +11169,14 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(forkSession).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: "/workspace", additionalDirectories: ["/workspace/extra"] }),
+      expect.objectContaining({ resume: "fork-id" }),
+    );
   });
 
   it("forks at an AIR message id through the current SDK", async () => {
-    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const { agent } = forkingAgent();
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
       {
         type: "assistant",
@@ -11028,8 +11232,7 @@ describe("session/fork", () => {
       messageOccurrence: 2,
     },
   ])("forks at an inactive persisted branch by $resolution", async (forkPoint) => {
-    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const { agent } = forkingAgent();
     const targetText = "Answer from the branch that is no longer active.";
     const targetFingerprint = `sha256:${createHash("sha256").update(targetText).digest("hex")}`;
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
@@ -11228,12 +11431,13 @@ describe("session/close", () => {
     expect(session.abortController.signal.aborted).toBe(true);
   });
 
-  it("should throw when closing a non-existent session", async () => {
+  it("is idempotent for a session that is not loaded here", async () => {
     const agent = createMockAgent();
 
-    await expect(agent.closeSession({ sessionId: "non-existent" })).rejects.toThrow(
-      "Session not found",
-    );
+    await expect(agent.closeSession({ sessionId: "non-existent" })).resolves.toEqual({});
+    injectSession(agent, "session-1");
+    await agent.closeSession({ sessionId: "session-1" });
+    await expect(agent.closeSession({ sessionId: "session-1" })).resolves.toEqual({});
   });
 
   it("should not affect other sessions when closing one", async () => {
@@ -17416,6 +17620,984 @@ describe("post-error recovery", () => {
   });
 });
 
+// A cancel drops what the work it stopped still sends, and only that: a model
+// request that serves none of the cancelled prompts, such as Claude Code's
+// follow-up after a background command finished, reaches the client. The
+// streams follow what CLI 2.1.293 sends: it ends the interrupted turn with an
+// aborted result, then goes on with its queue, and reports idle at the end.
+describe("output after a cancel", () => {
+  const idle = { type: "system", subtype: "session_state_changed", state: "idle" };
+
+  /** An assistant message of the main conversation with one text block. */
+  function assistant(text: string) {
+    return {
+      type: "assistant",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        id: `msg_${randomUUID()}`,
+        role: "assistant",
+        model: "claude-sonnet-4-20250514",
+        content: [{ type: "text", text }],
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+    };
+  }
+
+  /** A stream event of the main conversation, or of the subagent that the
+   *  tool use `parent` started. */
+  const streamEvent = (event: Record<string, unknown>, parent: string | null = null) => ({
+    type: "stream_event",
+    parent_tool_use_id: parent,
+    uuid: randomUUID(),
+    session_id: "test-session",
+    event,
+  });
+  const messageStart = (parent: string | null = null) =>
+    streamEvent(
+      {
+        type: "message_start",
+        message: { id: `msg_${randomUUID()}`, model: "claude-sonnet-4-20250514", usage: {} },
+      },
+      parent,
+    );
+  const blockStart = (index: number, parent: string | null = null) =>
+    streamEvent(
+      { type: "content_block_start", index, content_block: { type: "text", text: "" } },
+      parent,
+    );
+  /** The deltas that stream `chunks` into the text block `index`. */
+  const textDeltas = (index: number, chunks: string[], parent: string | null = null) =>
+    chunks.map((text) =>
+      streamEvent(
+        { type: "content_block_delta", index, delta: { type: "text_delta", text } },
+        parent,
+      ),
+    );
+
+  /** How Claude Code sends an assistant message of the main conversation with
+   *  one text block: it streams the text, one delta per chunk, then sends the
+   *  whole message. */
+  function answer(...chunks: string[]) {
+    return [
+      messageStart(),
+      blockStart(0),
+      ...textDeltas(0, chunks),
+      assistant(chunks.join("")),
+      streamEvent({ type: "content_block_stop", index: 0 }),
+      streamEvent({ type: "message_stop" }),
+    ];
+  }
+
+  /** How Claude Code starts the turn of `prompt` (a pushed user message). */
+  function startTurn(prompt: { uuid: string }) {
+    return [
+      lifecycleFrame(prompt.uuid, "started"),
+      markersInit,
+      requesting(prompt.uuid),
+      userEcho(prompt),
+    ];
+  }
+
+  /** The result of the turn of the prompt `uuid`. */
+  const stampedResult = (uuid: string, overrides: Record<string, unknown> = {}) =>
+    successfulResultMessage({ user_message_uuid: uuid, user_message_uuids: [uuid], ...overrides });
+
+  /** The result that ends the turn of the prompt `uuid` when an interrupt
+   *  stopped it while the model streamed. */
+  const abortedResult = (uuid: string) =>
+    stampedResult(uuid, {
+      subtype: "error_during_execution",
+      is_error: true,
+      stop_reason: null,
+      terminal_reason: "aborted_streaming",
+    });
+
+  /** Claude Code's follow-up after a background command finished: a model
+   *  cycle that it starts on its own, after the request that starts it. */
+  function followup() {
+    return [
+      ...answer("The build", " passed."),
+      successfulResultMessage({ origin: { kind: "task-notification" } }),
+      idle,
+    ];
+  }
+
+  /** An agent on a session that `makeGenerator` scripts, and the text of every
+   *  agent message chunk its client receives. */
+  function setup(makeGenerator: (input: Pushable<any>) => AsyncGenerator<any>) {
+    const texts: string[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async ({ update }: SessionNotification) => {
+          if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+            texts.push(update.content.text);
+          }
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, makeGenerator);
+    return { agent, texts };
+  }
+
+  /** Sends the prompt `text` and waits until its turn is active. Returns the
+   *  prompt and the session's consumer, which ends with the scripted stream. */
+  async function promptActive(agent: ClaudeAcpAgent, text: string) {
+    const prompt = agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text }] });
+    await vi.waitFor(() => expect(agent.sessions["test-session"]?.activeTurn).toBeTruthy());
+    return { prompt, consumer: agent.sessions["test-session"]!.consumer };
+  }
+
+  it("answers a cancelled prompt at its interrupted result and delivers the follow-up that Claude Code runs next", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const answered = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: prompt } = await iter.next();
+        yield* startTurn(prompt);
+        yield messageStart();
+        yield blockStart(0);
+        yield* textDeltas(0, ["Starting the build."]);
+        await cancelled.promise;
+        // What the interrupt flushes: the rest of the message that streamed.
+        yield* textDeltas(0, [" Still starting."]);
+        yield assistant("Starting the build. Still starting.");
+        yield {
+          type: "user",
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "[Request interrupted by user]" }],
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield streamEvent({ type: "message_stop" });
+        yield abortedResult(prompt.uuid);
+        yield lifecycleFrame(prompt.uuid, "cancelled");
+        await answered.promise;
+        // A command that the turn backgrounded finished while it ran, so
+        // Claude Code runs its follow-up next, with no idle in between.
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    const { prompt, consumer } = await promptActive(agent, "build it");
+    await vi.waitFor(() => expect(texts).toEqual(["Starting the build."]));
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+
+    // Before Claude Code goes on with the follow-up and reports idle, and
+    // after the text that the interrupt flushed.
+    await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    expect(texts).toEqual(["Starting the build.", " Still starting."]);
+    answered.resolve();
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", " Still starting.", "The build", " passed."]);
+  });
+
+  it("delivers a follow-up that Claude Code runs after a cancel while nothing ran", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: prompt } = await iter.next();
+        yield* startTurn(prompt);
+        yield* answer("Started the build in the background.");
+        yield stampedResult(prompt.uuid);
+        yield lifecycleFrame(prompt.uuid, "completed");
+        yield idle;
+        await cancelled.promise;
+        yield idle; // an interrupt while nothing runs makes Claude Code report idle again
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "build it in the background" }],
+      }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    const consumer = agent.sessions["test-session"]!.consumer;
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+
+    await consumer;
+    expect(texts).toEqual(["Started the build in the background.", "The build", " passed."]);
+  });
+
+  it("drops the answer to a prompt that Claude Code had taken off its queue before the cancel", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        const { value: second } = await iter.next();
+        yield lifecycleFrame(second.uuid, "queued");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        // Claude Code had already taken the second prompt, so it still runs it.
+        yield lifecycleFrame(second.uuid, "started");
+        yield requesting(second.uuid);
+        yield userEcho(second);
+        yield* answer("Here is the second answer.");
+        yield stampedResult(second.uuid);
+        yield lifecycleFrame(second.uuid, "completed");
+        yield idle;
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "and test it" }],
+    });
+    await vi.waitFor(() =>
+      expect(agent.sessions["test-session"]?.turnQueue?.length).toBeGreaterThanOrEqual(2),
+    );
+    // The interrupt receipt leaves out a prompt that Claude Code has already
+    // taken off its queue, so the orphan accounting forgets it.
+    vi.mocked(agent.sessions["test-session"]!.query.interrupt).mockResolvedValue({
+      still_queued: [],
+    });
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+  });
+
+  it("does not let the next prompt take the result of a prompt the cancel abandoned", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        const { value: second } = await iter.next();
+        yield lifecycleFrame(second.uuid, "queued");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        // The user sends the third prompt once the first is answered, while
+        // Claude Code still runs the second, which it had already taken.
+        const { value: third } = await iter.next();
+        yield lifecycleFrame(third.uuid, "queued");
+        yield lifecycleFrame(second.uuid, "started");
+        yield requesting(second.uuid);
+        yield userEcho(second);
+        yield* answer("Here is the second answer.");
+        yield stampedResult(second.uuid, {
+          usage: {
+            input_tokens: 999,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        });
+        yield lifecycleFrame(second.uuid, "completed");
+        yield* startTurn(third);
+        yield* answer("Here is the third answer.");
+        yield stampedResult(third.uuid);
+        yield lifecycleFrame(third.uuid, "completed");
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "and test it" }],
+    });
+    await vi.waitFor(() =>
+      expect(agent.sessions["test-session"]?.turnQueue?.length).toBeGreaterThanOrEqual(2),
+    );
+    // The interrupt receipt leaves out a prompt that Claude Code has already
+    // taken off its queue, so the orphan accounting forgets it.
+    vi.mocked(agent.sessions["test-session"]!.query.interrupt).mockResolvedValue({
+      still_queued: [],
+    });
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+
+    const third = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "and deploy it" }],
+    });
+    await consumer;
+    expect(third.stopReason).toBe("end_turn");
+    expect(third.usage?.inputTokens).toBe(0);
+    expect(texts).toEqual(["Starting the build.", "Here is the third answer."]);
+  });
+
+  it("drops an abandoned prompt that Claude Code folds into its own follow-up", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        const { value: second } = await iter.next();
+        yield lifecycleFrame(second.uuid, "queued");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        // Claude Code starts its own follow-up, then folds the still queued
+        // second prompt into it, so only later requests name that prompt.
+        yield requesting();
+        yield* answer("The build passed, and");
+        yield lifecycleFrame(second.uuid, "started");
+        yield requesting(second.uuid);
+        yield* answer("here is the second answer.");
+        yield successfulResultMessage({
+          origin: { kind: "task-notification" },
+          user_message_uuid: second.uuid,
+          user_message_uuids: [second.uuid],
+        });
+        yield lifecycleFrame(second.uuid, "completed");
+        yield idle;
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "and test it" }],
+    });
+    await vi.waitFor(() =>
+      expect(agent.sessions["test-session"]?.turnQueue?.length).toBeGreaterThanOrEqual(2),
+    );
+    vi.mocked(agent.sessions["test-session"]!.query.interrupt).mockImplementation(async () => ({
+      still_queued: [...agent.sessions["test-session"]!.orphanCommands!.keys()],
+    }));
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+  });
+
+  it("drops the answer to a prompt sent while the cancel was still in progress", async () => {
+    const interrupting = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const cancelDone = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        const { value: second } = await iter.next(); // sent during the cancel
+        await cancelDone.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        // Claude Code had already taken the second prompt, so it still runs it.
+        yield lifecycleFrame(second.uuid, "started");
+        yield requesting(second.uuid);
+        yield userEcho(second);
+        yield* answer("Here is the second answer.");
+        yield stampedResult(second.uuid);
+        yield lifecycleFrame(second.uuid, "completed");
+        yield idle;
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    const session = agent.sessions["test-session"]!;
+    vi.mocked(session.query.interrupt).mockResolvedValue({ still_queued: [] });
+    // Hold the cancel at its first await, before it sweeps the queue.
+    const compaction = session.contextCompaction!;
+    const interrupt = compaction.interrupt.bind(compaction);
+    compaction.interrupt = async () => {
+      interrupting.resolve();
+      await release.promise;
+      return interrupt();
+    };
+
+    const cancelling = agent.cancel({ sessionId: "test-session" });
+    await interrupting.promise;
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "and test it" }],
+    });
+    await vi.waitFor(() => expect(session.turnQueue?.length).toBeGreaterThanOrEqual(2));
+    release.resolve();
+    await cancelling;
+    cancelDone.resolve();
+
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+    expect(session.lastTurnFailed).not.toBe(true);
+  });
+
+  it("drops the answer to a prompt sent during the cancel whose request comes before the cancel abandons it", async () => {
+    const interrupting = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const requested = Promise.withResolvers<void>();
+    const swept = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        const { value: second } = await iter.next(); // sent during the cancel
+        // The first turn ends on its own, and Claude Code takes the second
+        // prompt before the cancel drops it from the queue.
+        yield stampedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "completed");
+        yield lifecycleFrame(second.uuid, "started");
+        yield requesting(second.uuid);
+        requested.resolve(); // the consumer asks for more once it handled the request
+        await swept.promise;
+        yield userEcho(second);
+        yield* answer("Here is the second answer.");
+        yield stampedResult(second.uuid);
+        yield lifecycleFrame(second.uuid, "completed");
+        yield idle;
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    const session = agent.sessions["test-session"]!;
+    vi.mocked(session.query.interrupt).mockResolvedValue({ still_queued: [] });
+    // Hold the cancel at its first await, before it sweeps the queue.
+    const compaction = session.contextCompaction!;
+    const interrupt = compaction.interrupt.bind(compaction);
+    compaction.interrupt = async () => {
+      interrupting.resolve();
+      await release.promise;
+      return interrupt();
+    };
+
+    const cancelling = agent.cancel({ sessionId: "test-session" });
+    await interrupting.promise;
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "and test it" }],
+    });
+    // The consumer reads the second prompt's request while the cancel waits.
+    await requested.promise;
+    release.resolve();
+    await cancelling;
+    swept.resolve();
+
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+  });
+
+  it("keeps the prompts an earlier cancel stopped when the user cancels again", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const answered = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        const { value: second } = await iter.next();
+        yield lifecycleFrame(second.uuid, "queued");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        await answered.promise; // the user cancels again
+        yield lifecycleFrame(second.uuid, "started");
+        yield requesting(second.uuid);
+        yield userEcho(second);
+        yield* answer("Here is the second answer.");
+        yield stampedResult(second.uuid);
+        yield lifecycleFrame(second.uuid, "completed");
+        yield idle;
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "and test it" }],
+    });
+    await vi.waitFor(() =>
+      expect(agent.sessions["test-session"]?.turnQueue?.length).toBeGreaterThanOrEqual(2),
+    );
+    vi.mocked(agent.sessions["test-session"]!.query.interrupt).mockResolvedValue({
+      still_queued: [],
+    });
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    await agent.cancel({ sessionId: "test-session" });
+    answered.resolve();
+
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+  });
+
+  it("drops the answer to a steer that Claude Code had taken before the cancel", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: prompt } = await iter.next();
+        yield* startTurn(prompt);
+        yield* answer("Starting the build.");
+        const { value: steer } = await iter.next();
+        await cancelled.promise;
+        yield abortedResult(prompt.uuid);
+        yield lifecycleFrame(prompt.uuid, "cancelled");
+        // Claude Code had already taken the steer, so it still runs it.
+        yield lifecycleFrame(steer.uuid, "started");
+        yield requesting(steer.uuid);
+        yield userEcho(steer);
+        yield* answer("Building it with X too.");
+        yield stampedResult(steer.uuid);
+        yield lifecycleFrame(steer.uuid, "completed");
+        yield idle;
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    const { prompt, consumer } = await promptActive(agent, "build it");
+    await agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also X" }] });
+    vi.mocked(agent.sessions["test-session"]!.query.interrupt).mockResolvedValue({
+      still_queued: [],
+    });
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+
+    await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+  });
+
+  it("does not fail the next prompt on the idle that trails a cancelled steered turn's result", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        await iter.next(); // the steer, which the cancel drops from Claude Code's queue
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        const { value: second } = await iter.next();
+        yield* startTurn(second);
+        yield idle; // the cancelled turn's trailer, lagging past the next prompt's echo
+        yield* answer("Here is the second answer.");
+        yield stampedResult(second.uuid);
+        yield lifecycleFrame(second.uuid, "completed");
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    await agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also X" }] });
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test it" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "Here is the second answer."]);
+  });
+
+  it("keeps the window open across the cancelled turn's next model request", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: prompt } = await iter.next();
+        yield* startTurn(prompt);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        // The turn had moved on to its next model request when the interrupt
+        // arrived. Its text streams before the turn ends.
+        yield requesting(prompt.uuid);
+        yield* answer("Running the tests.");
+        yield abortedResult(prompt.uuid);
+        yield lifecycleFrame(prompt.uuid, "cancelled");
+        yield idle;
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    const { prompt, consumer } = await promptActive(agent, "build it");
+    await vi.waitFor(() => expect(texts).toEqual(["Starting the build."]));
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+
+    await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "Running the tests.", "The build", " passed."]);
+  });
+
+  it("does not fail the next prompt on the idle that trails the cancelled turn's result", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        const { value: second } = await iter.next();
+        yield* startTurn(second);
+        yield idle; // the cancelled turn's trailer, lagging past the next prompt's echo
+        yield* answer("Here is the second answer.");
+        yield stampedResult(second.uuid);
+        yield lifecycleFrame(second.uuid, "completed");
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test it" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "Here is the second answer."]);
+  });
+
+  it("keeps dropping output after a cancel until the next prompt when requests do not list their prompts", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: prompt } = await iter.next();
+        yield lifecycleInit; // no request_marker_lists_v1
+        yield userEcho(prompt);
+        yield* answer("Started the build in the background.");
+        yield successfulResultMessage();
+        yield idle;
+        await cancelled.promise;
+        yield idle;
+        yield requesting();
+        yield* followup();
+      })(),
+    );
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "build it in the background" }],
+      }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    const consumer = agent.sessions["test-session"]!.consumer;
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+
+    await consumer;
+    expect(texts).toEqual(["Started the build in the background."]);
+  });
+
+  it("delivers the next prompt's answer once when its echo arrives in the middle of its stream", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield lifecycleInit; // no request_marker_lists_v1: output is dropped until the next echo
+        yield userEcho(first);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield idle;
+        const { value: second } = await iter.next();
+        yield messageStart();
+        yield blockStart(0);
+        yield* textDeltas(0, ["Here is"]); // dropped: the echo comes after it
+        yield userEcho(second);
+        yield* textDeltas(0, [" the second answer."]);
+        yield assistant("Here is the second answer.");
+        // Claude Code sends each block of a message as its own message.
+        yield blockStart(1);
+        yield* textDeltas(1, ["And", " more."]);
+        yield assistant("And more.");
+        yield streamEvent({ type: "message_stop" });
+        yield stampedResult(second.uuid);
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    await vi.waitFor(() => expect(texts).toEqual(["Starting the build."]));
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test it" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    await consumer;
+    // The first block once, whole, and the next block as it streamed.
+    expect(texts).toEqual(["Starting the build.", "Here is the second answer.", "And", " more."]);
+  });
+
+  it("delivers a follow-up that Claude Code runs before a prompt sent after the cancel", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        // The user sends the next prompt once the first is answered, and
+        // Claude Code runs its follow-up first.
+        const { value: second } = await iter.next();
+        yield lifecycleFrame(second.uuid, "queued");
+        yield requesting();
+        yield* followup();
+        yield* startTurn(second);
+        yield* answer("Here is the second answer.");
+        yield stampedResult(second.uuid);
+        yield lifecycleFrame(second.uuid, "completed");
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    await vi.waitFor(() => expect(texts).toEqual(["Starting the build."]));
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test it" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    await consumer;
+    expect(texts).toEqual([
+      "Starting the build.",
+      "The build",
+      " passed.",
+      "Here is the second answer.",
+    ]);
+  });
+
+  it("delivers what streams of a subagent's text once the window closes, for a client that gets it only streamed", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield lifecycleInit; // no request_marker_lists_v1: output is dropped until the next echo
+        yield userEcho(first);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield idle;
+        const { value: second } = await iter.next();
+        yield messageStart("toolu_agent");
+        yield blockStart(0, "toolu_agent");
+        yield* textDeltas(0, ["Reading"], "toolu_agent"); // dropped: the echo comes after it
+        yield userEcho(second);
+        yield* textDeltas(0, [" the files."], "toolu_agent");
+        // The whole message carries no text for this client.
+        yield { ...assistant("Reading the files."), parent_tool_use_id: "toolu_agent" };
+        yield stampedResult(second.uuid);
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    await vi.waitFor(() => expect(texts).toEqual(["Starting the build."]));
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test it" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", " the files."]);
+  });
+});
+
+// A client that renders terminals (here Zed's terminal extension) sees the
+// terminal of a command in the background run until the command's task ends.
+// AIR shows such a command through its async tasks, so its terminal exits at
+// the Bash result, as before.
+describe("terminal of a command in the background", () => {
+  const idle = { type: "system", subtype: "session_state_changed", state: "idle" };
+  const taskEvent = (subtype: string, fields: Record<string, unknown>) => ({
+    type: "system",
+    subtype,
+    task_id: "bg1",
+    uuid: randomUUID(),
+    session_id: "test-session",
+    ...fields,
+  });
+
+  /** A turn that sends `make test` to the background; the command's task ends
+   *  once `ended` resolves. */
+  function backgroundCommand(ended: Promise<void>) {
+    return (input: Pushable<any>) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        yield userEcho((await iter.next()).value);
+        yield taskEvent("task_started", {
+          task_type: "local_bash",
+          description: "make test",
+          tool_use_id: "toolu_bg",
+          is_backgrounded: true,
+        });
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: "msg_bg",
+            role: "assistant",
+            model: "claude-sonnet-4-20250514",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_bg",
+                name: "Bash",
+                input: { command: "make test", run_in_background: true },
+              },
+            ],
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        };
+        yield {
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_bg",
+                content: "Command running in background with ID: bg1.",
+              },
+            ],
+          },
+          tool_use_result: {
+            stdout: "",
+            stderr: "",
+            interrupted: false,
+            isImage: false,
+            backgroundTaskId: "bg1",
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield successfulResultMessage();
+        yield idle;
+        await ended;
+        yield taskEvent("task_updated", { patch: { status: "completed" } });
+        yield taskEvent("task_notification", {
+          tool_use_id: "toolu_bg",
+          status: "completed",
+          output_file: "/tmp/tasks/bg1.output",
+          summary: 'Background command "make test" completed',
+        });
+      })();
+  }
+
+  /** Runs the turn for a client with `capabilities`, and returns the
+   *  `terminal_exit` of each report about the Bash call, with whether it came
+   *  before or after the prompt's answer. */
+  async function terminalExits(capabilities: ClientCapabilities) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async (n: SessionNotification) => void updates.push(n) } as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, capabilities);
+    const ended = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, backgroundCommand(ended.promise));
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test it" }] });
+    const answeredAt = updates.length;
+    const consumer = agent.sessions["test-session"]!.consumer;
+    ended.resolve();
+    await consumer;
+    return updates.flatMap((notification, index) => {
+      const update = notification.update;
+      const exit =
+        update.sessionUpdate === "tool_call_update" && update.toolCallId === "toolu_bg"
+          ? (update._meta as { terminal_exit?: unknown } | undefined)?.terminal_exit
+          : undefined;
+      return exit ? [{ exit, afterAnswer: index >= answeredAt }] : [];
+    });
+  }
+
+  it("ends the terminal when the command's task ends", async () => {
+    expect(await terminalExits({ _meta: { terminal_output: true } })).toEqual([
+      {
+        exit: { terminal_id: "toolu_bg", exit_code: null, signal: null },
+        afterAnswer: true,
+      },
+    ]);
+  });
+
+  it("ends an AIR client's terminal at the Bash result, as before", async () => {
+    expect(
+      await terminalExits({
+        ...AIR_CLIENT_CAPABILITIES,
+        _meta: { ...AIR_CLIENT_CAPABILITIES._meta, terminal_output: true },
+      }),
+    ).toEqual([
+      { exit: { terminal_id: "toolu_bg", exit_code: 0, signal: null }, afterAnswer: false },
+    ]);
+  });
+});
+
 describe("deferred settlement for live background subagents (issues #864/#866)", () => {
   // A turn whose terminal result arrives while background subagents IT
   // spawned are still live must NOT settle at that result: ACP allows
@@ -17609,6 +18791,67 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
+  it("resumes a held turn's foreground work for a steer, and ends it again at the steered result", async () => {
+    const foreground: string[] = [];
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async () => {} } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+      {
+        foreground: () => ({
+          running: () => foreground.push("running"),
+          awaitingUser: () => foreground.push("awaitingUser"),
+          ended: (outcome) =>
+            foreground.push(`ended ${outcome.stopReason} ${outcome.usage?.totalTokens}`),
+          failed: () => foreground.push("failed"),
+        }),
+      },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        yield userEcho((await iter.next()).value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // held for agent-1
+        yield idle();
+        // The steer runs as a cycle of the held turn.
+        yield userEcho((await iter.next()).value);
+        yield assistantText("Steered answer");
+        yield resultMessage();
+        // The steered turn settles at an idle, held again for agent-1.
+        yield idle();
+        yield taskNotification("agent-1");
+        yield assistantText("promised summary");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await vi.waitFor(() =>
+      expect(agent.sessions["test-session"]?.activeTurn?.deferredSettle).toBeDefined(),
+    );
+    await agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also X" }] });
+
+    expect((await turn).stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+    expect(foreground).toEqual([
+      "running",
+      "ended end_turn 15",
+      // The steer resumes the turn's work, which ends at the steered result
+      // with the turn's usage, both of its cycles.
+      "running",
+      "ended end_turn 30",
+      // The follow-up after the subagent finished is a cycle of its own.
+      "running",
+      "ended end_turn 15",
+    ]);
+  });
+
   describe("ExitPlanMode answered inside a held turn's followup (issue #1167)", () => {
     // Plan mode + a background Explore agent: the user turn's result holds,
     // the subagent finishes, and the model writes the plan and calls
@@ -17749,6 +18992,156 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           }),
         }),
       );
+      // This client did not advertise plan operations.
+      expect(updates.map((n) => n.update.sessionUpdate)).not.toContain("plan_update");
+    });
+
+    it("shows a plan approved with clearing the context as the session's markdown plan", async () => {
+      const updates: any[] = [];
+      const agent = new ClaudeAcpAgent(
+        { sessionUpdate: async (n: any) => updates.push(n) } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await initializeClient(agent, { plan: {} });
+      vi.spyOn(agent as any, "createSession").mockImplementation(
+        async (_params: any, options: any) => {
+          const input = new Pushable<any>();
+          async function* freshGenerator() {
+            yield userEcho((await input[Symbol.asyncIterator]().next()).value);
+            yield assistantText("Implemented");
+            yield resultMessage();
+            yield idle();
+          }
+          agent.sessions["test-session"] = mockSessionState({
+            query: wrapQuery(freshGenerator()),
+            input,
+            modes: { currentModeId: options.permissionMode, availableModes: [] },
+            fastModeEnabled: false,
+          });
+          return { sessionId: "test-session" };
+        },
+      );
+      injectGeneratorSession(
+        agent,
+        (input) =>
+          (async function* () {
+            yield* heldTurnPlanningFollowup((await input[Symbol.asyncIterator]().next()).value);
+            yield idle();
+          })(),
+        {
+          creationParams: { cwd: "/test", mcpServers: [] },
+          // The plan the user approved, which the fresh context carries out.
+          pendingExitPlanContextReset: {
+            toolUseId: "tool-plan",
+            plan: "Implement it as approved",
+            mode: "auto",
+          },
+        },
+      );
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] });
+
+      expect(updates.filter((n) => n.update.sessionUpdate === "plan_update")).toEqual([
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "plan_update",
+            plan: { type: "markdown", planId: "plan-mode", content: "Implement it as approved" },
+          },
+        },
+      ]);
+    });
+
+    it("keeps the turn as the session's foreground work across the clear-context restart", async () => {
+      const foreground: string[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async () => {},
+          requestPermission: async (request: any) => ({
+            outcome: {
+              outcome: "selected",
+              optionId: request.options.find((option: any) => option.kind === "allow_once")
+                .optionId,
+            },
+          }),
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+        {
+          foreground: () => ({
+            running: () => foreground.push("running"),
+            awaitingUser: () => foreground.push("awaitingUser"),
+            ended: (outcome) =>
+              foreground.push(`ended ${outcome.stopReason} ${outcome.usage?.totalTokens}`),
+            failed: () => foreground.push("failed"),
+          }),
+        },
+      );
+      vi.spyOn(agent as any, "createSession").mockImplementation(
+        async (_params: any, options: any) => {
+          const input = new Pushable<any>();
+          async function* freshGenerator() {
+            const next = await input[Symbol.asyncIterator]().next();
+            yield userEcho(next.value);
+            yield running();
+            // The continuation asks for permission in the fresh query.
+            await agent.canUseTool("test-session")(
+              "Bash",
+              { command: "ls" },
+              {
+                signal: new AbortController().signal,
+                suggestions: [],
+                toolUseID: "toolu_ls",
+                requestId: "request-ls",
+              },
+            );
+            yield assistantText("Implemented");
+            yield resultMessage({ stop_reason: "max_tokens" });
+            yield idle();
+          }
+          agent.sessions["test-session"] = mockSessionState({
+            query: wrapQuery(freshGenerator()),
+            input,
+            modes: { currentModeId: options.permissionMode, availableModes: [] },
+            fastModeEnabled: false,
+          });
+          return { sessionId: "test-session" };
+        },
+      );
+      injectGeneratorSession(
+        agent,
+        (input) => {
+          async function* messageGenerator() {
+            const { value: first } = await input[Symbol.asyncIterator]().next();
+            yield* heldTurnPlanningFollowup(first);
+            yield idle();
+          }
+          return messageGenerator();
+        },
+        {
+          creationParams: { cwd: "/test", mcpServers: [] },
+          pendingExitPlanContextReset: {
+            toolUseId: "tool-plan",
+            plan: "Implement it",
+            mode: "default",
+          },
+        },
+      );
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] });
+
+      // The turn's work ends at its result, though v1's answer is held. The
+      // follow-up that plans is a cycle, which the continuation takes over
+      // without a new `running`. The restart replaces the session behind the
+      // id; the work stays with the id.
+      expect(foreground).toEqual([
+        "running",
+        "ended end_turn 15",
+        "running",
+        "awaitingUser",
+        "running",
+        // The turn's usage: the carried 15 and the continuation's.
+        "ended max_tokens 30",
+      ]);
     });
 
     it("cancels the held turn when the user keeps planning", async () => {
@@ -17773,6 +19166,40 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(response.usage?.totalTokens).toBe(15);
       expect(createSession).not.toHaveBeenCalled();
       expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
+    });
+
+    it("ends the follow-up cycle cancelled, not failed, when the user keeps planning", async () => {
+      const foreground: string[] = [];
+      const agent = new ClaudeAcpAgent(
+        { sessionUpdate: async () => {} } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+        {
+          foreground: () => ({
+            running: () => foreground.push("running"),
+            awaitingUser: () => foreground.push("awaitingUser"),
+            ended: (outcome) => foreground.push(`ended ${outcome.stopReason}`),
+            failed: () => foreground.push("failed"),
+          }),
+        },
+      );
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: first } = await input[Symbol.asyncIterator]().next();
+          yield* heldTurnPlanningFollowup(first);
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "plan" }],
+      });
+
+      expect(response.stopReason).toBe("cancelled");
+      // The turn's work ended at its result; the follow-up that planned is a
+      // cycle, which the error-shaped diagnostic of the answer ends cancelled.
+      expect(foreground).toEqual(["running", "ended end_turn", "running", "ended cancelled"]);
     });
   });
 
@@ -18176,6 +19603,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(session.liveBackgroundTasks.get("agent-1")).toEqual({
         parentToolUseId: "toolu_agent-1",
         isSubagent: true,
+        backgrounded: true,
       });
       expect(
         updates.flatMap((n) =>
@@ -18221,6 +19649,39 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       release();
       await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
       await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("ignores a late notification of the earlier run after the resume", async () => {
+      const { agent, updates, release, start } = run(
+        [
+          { ...taskUpdated("running"), run_id: "run-2" },
+          sendMessageResult(),
+          { ...taskNotification("agent-1"), run_id: "run-1" },
+          { ...taskUpdated("completed"), run_id: "run-1" },
+        ],
+        { subagents: true },
+      );
+      const { second } = await start();
+      const session = agent.sessions["test-session"]!;
+      // Let the stream run past the late frames to the gate.
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(session.activeTurn?.deferredSettle).toBeDefined();
+      expect(session.liveBackgroundTasks.get("agent-1")).toEqual({
+        parentToolUseId: "toolu_agent-1",
+        isSubagent: true,
+        backgrounded: true,
+      });
+      expect(session.nativeSubagentsByTaskId?.get("agent-1")?.terminalState).toBeUndefined();
+      expect(
+        updates.flatMap((n) =>
+          n.update.sessionUpdate === "subagent_state_update" ? [n.update.subagentSessionId] : [],
+        ),
+      ).toEqual(["agent-1"]);
+
+      release();
+      await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+      await session.consumer;
     });
 
     it("ends the hold of the SendMessage turn at cancel()", async () => {
@@ -19054,6 +20515,377 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     ).rejects.toMatchObject({ code: -32603 });
     await agent.sessions["test-session"]?.consumer;
   });
+
+  it("settles a held turn cancelled at its follow-up's interrupted result, then delivers a later follow-up", async () => {
+    // A cancel during the follow-up of a held turn leaves the turn to that
+    // follow-up's result. The follow-up's next model request names no prompt,
+    // but until the held turn settles, its output is still the cancelled work's.
+    const { agent, events } = chunkCapturingAgent();
+    const cancelled = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield markersInit;
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // turn 1 held; no idle while the agent lives
+        yield taskNotification("agent-1");
+        yield requesting(); // the follow-up starts
+        yield assistantText("The agent found three files.");
+        await cancelled.promise;
+        yield requesting(); // its next request, after a tool ran
+        yield assistantText("Summarizing them.");
+        yield resultMessage({
+          origin: { kind: "task-notification" },
+          subtype: "error_during_execution",
+          is_error: true,
+          stop_reason: null,
+          terminal_reason: "aborted_streaming",
+        });
+        // A command that the turn backgrounded finished meanwhile, so Claude
+        // Code runs its follow-up next, with no idle in between.
+        yield requesting();
+        yield assistantText("The build passed.");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await waitFor(() => events.includes("chunk:The agent found three files."));
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    await agent.sessions["test-session"]?.consumer;
+    expect(events).toEqual(["chunk:The agent found three files.", "chunk:The build passed."]);
+  });
+
+  it("does not settle a cancelled held turn at a follow-up result the interrupt did not stop", async () => {
+    const { agent, events } = chunkCapturingAgent();
+    const cancelled = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield markersInit;
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // turn 1 held
+        yield taskNotification("agent-1");
+        yield requesting();
+        yield assistantText("The agent found three files.");
+        await cancelled.promise;
+        // A placeholder result, which Claude Code sends before a shared
+        // follow-up runs; the interrupt did not stop it.
+        yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 0 });
+        yield requesting();
+        yield assistantText("Summarizing them.");
+        yield resultMessage({
+          origin: { kind: "task-notification" },
+          subtype: "error_during_execution",
+          is_error: true,
+          stop_reason: null,
+          terminal_reason: "aborted_streaming",
+        });
+        yield requesting();
+        yield assistantText("The build passed.");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await waitFor(() => events.includes("chunk:The agent found three files."));
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    await agent.sessions["test-session"]?.consumer;
+    expect(events).toEqual(["chunk:The agent found three files.", "chunk:The build passed."]);
+  });
+
+  it("settles a held turn at once when the cancel lands while only its subagent runs", async () => {
+    // Claude Code reports `running` while the subagent lives, so only the
+    // model requests tell that no follow-up runs.
+    const { agent, events } = chunkCapturingAgent();
+    const cancelled = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield markersInit;
+        yield requesting(u1.value.uuid);
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // turn 1 held; no idle while the agent lives
+        await cancelled.promise;
+        // The interrupt stops the subagent. A command that the turn
+        // backgrounded finished meanwhile, so its follow-up runs next.
+        yield { ...taskNotification("agent-1"), status: "stopped" };
+        yield requesting();
+        yield assistantText("The build passed.");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    await agent.cancel({ sessionId: "test-session" });
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    cancelled.resolve();
+
+    await agent.sessions["test-session"]?.consumer;
+    expect(events).toEqual(["chunk:The build passed."]);
+  });
+
+  describe("a prompt folded into an autonomous cycle", () => {
+    // A prompt sent while the CLI runs an autonomous cycle is folded into that
+    // cycle between tool rounds. The cycle's result keeps its autonomous origin
+    // but names the folded send in user_message_uuids, so it is that prompt's
+    // result — skipping it as autonomous would hang the prompt forever.
+
+    /** The CLI keeps its stream open after the cycle, so an unsettled prompt
+     *  hangs instead of being swept up by the stream ending. */
+    function liveStream() {
+      let end!: () => void;
+      const ended = new Promise<void>((resolve) => (end = resolve));
+      return { ended, end };
+    }
+
+    it("settles a prompt the CLI folded into a task-notification cycle", async () => {
+      const agent = createMockAgent();
+      const stream = liveStream();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          yield running();
+          yield assistantText("autonomous work");
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(userMessage);
+          yield assistantText("folded answer");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: userMessage.uuid,
+            user_message_uuids: [userMessage.uuid],
+          });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("settles a folded prompt the CLI never echoed", async () => {
+      const agent = createMockAgent();
+      const stream = liveStream();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          yield running();
+          yield assistantText("autonomous work");
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          // No echo: the turn is still queued when the stamped result arrives.
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: userMessage.uuid,
+            user_message_uuids: [userMessage.uuid],
+          });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("hands off a held turn and settles the prompt folded into its followup", async () => {
+      const agent = createMockAgent();
+      const stream = liveStream();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield resultMessage(); // first prompt held for agent-1
+          yield idle();
+          // The second prompt arrives while the first is held; the subagent's
+          // followup cycle then consumes it.
+          const u2 = await iter.next();
+          yield taskNotification("agent-1");
+          yield userEcho(u2.value);
+          yield assistantText("summary and answer");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: u2.value.uuid,
+            user_message_uuids: [u2.value.uuid],
+          });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      const first = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "explore" }],
+      });
+      await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+      const second = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+      const secondResponse = await second;
+      expect(secondResponse.stopReason).toBe("end_turn");
+      expect(secondResponse.usage?.inputTokens).toBe(10);
+      expect(secondResponse.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("keeps a task-notification result naming no pending prompt off the user turn", async () => {
+      const agent = createMockAgent();
+      const unrelatedUuid = randomUUID();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(userMessage);
+          yield running();
+          // An autonomous cycle's result names a send that is not a pending
+          // prompt, so it must not settle the user's turn or lend it tokens.
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: unrelatedUuid,
+            user_message_uuids: [unrelatedUuid],
+            usage: {
+              input_tokens: 100,
+              output_tokens: 50,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          });
+          yield resultMessage();
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("keeps a held turn open when a followup result names its own prompt", async () => {
+      // A held turn already has its result, so a followup result naming its
+      // uuid is the cycle's own, not a fold into the turn: it must neither
+      // settle the hold nor lend the turn its tokens while a subagent lives.
+      const agent = createMockAgent();
+      const stream = liveStream();
+      let checkpointReached = false;
+      let resume!: () => void;
+      const resumed = new Promise<void>((resolve) => (resume = resolve));
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(userMessage);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield subagentStarted("agent-2");
+          yield resultMessage(); // held for both subagents
+          yield idle();
+          yield taskNotification("agent-1");
+          yield assistantText("partial summary");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            num_turns: 1,
+            user_message_uuid: userMessage.uuid,
+            user_message_uuids: [userMessage.uuid],
+          });
+          yield idle();
+          checkpointReached = true;
+          await resumed;
+          yield taskNotification("agent-2");
+          yield assistantText("final summary");
+          yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 1 });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      let resolved = false;
+      const prompt = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "explore" }] })
+        .then((r) => {
+          resolved = true;
+          return r;
+        });
+
+      await waitFor(() => checkpointReached);
+      // Let a premature settle propagate to the prompt before checking it.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(resolved).toBe(false);
+      resume();
+
+      const response = await prompt;
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+  });
 });
 
 describe("turn steering (_session/steering)", () => {
@@ -19834,7 +21666,7 @@ describe("turn steering (_session/steering)", () => {
 
       resolveUserInput(response);
       await pending;
-      expect(agent.sessions["test-session"].pendingUserInputCount).toBe(0);
+      expect(agent.sessions["test-session"].openUserInputs?.size ?? 0).toBe(0);
     },
   );
 
