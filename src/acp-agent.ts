@@ -7712,14 +7712,16 @@ export class ClaudeAcpAgent {
     // their compaction is running. Close it before ANY cancelled prompt
     // resolves, not just the active-turn idle/backstop paths.
     await session.contextCompaction?.interrupt();
-    // The per-tool-call state (the session of an eagerly emitted tool call,
-    // the fields the client holds, the hook callbacks) stays: a background
-    // subagent keeps running after a cancel
-    // (agentclientprotocol/agent-client-protocol#2308), and a tool call of
-    // its that a permission request emitted on the root before the child was
-    // announced must stay on the root, since the subagents RFD forbids moving
-    // it. The cancelled turn's own tool calls end through their results, or
-    // `closeUnfinished` when the turn settles, which drop their state.
+    // A cancel drops the state of each tool call (the session that a
+    // permission request emitted it in, the fields the client holds, the hook
+    // callbacks), even when publishing fails. AIR's draft ends every child
+    // here, so a later update of an ended child's tool call is then dropped
+    // instead of reaching that child's session. The RFD form keeps the state:
+    // a background subagent keeps running after a cancel
+    // (agentclientprotocol/agent-client-protocol#2308), and its tool call that
+    // a permission request emitted on the root before the child was announced
+    // must stay on the root, which the RFD requires. Each tool call drops its
+    // own state when it ends.
     try {
       await session.nativeSubagentRuntime?.parentCancelled(
         session.nativeSubagentDeliver ??
@@ -7731,6 +7733,12 @@ export class ClaudeAcpAgent {
         `Session ${params.sessionId}: failed to publish cancelled subagent state`,
         error,
       );
+    } finally {
+      if (session.nativeSubagentRuntime?.form !== "rfd") {
+        session.eagerToolCallSessions?.clear();
+        session.toolCallFields?.clear();
+        clearHookCallbacks(params.sessionId);
+      }
     }
     // The user messages this cancel abandons while Claude Code may still have
     // them queued: they are dropped from its queue before the interrupt.

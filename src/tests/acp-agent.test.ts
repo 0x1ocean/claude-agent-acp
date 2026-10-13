@@ -5586,6 +5586,76 @@ describe("subagent permission attribution (issue #851)", () => {
     ]);
   });
 
+  it("sends AIR no update of a child's permission tool call after the cancel ended the child", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => {
+          updates.push(notification);
+        },
+        requestPermission: async () => ({
+          outcome: { outcome: "selected", optionId: "allow-once" },
+        }),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: AIR_NATIVE_SUBAGENTS });
+    const cancelled = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, (input) =>
+      (async function* () {
+        const { value: prompt } = await input[Symbol.asyncIterator]().next();
+        yield userEcho(prompt);
+        yield rootToolUse("toolu_parent", "Agent");
+        yield {
+          ...taskStarted("agent-42", "toolu_parent"),
+          subagent_type: "Explore",
+          is_backgrounded: true,
+        };
+        await cancelled.promise;
+        // The child runs in the background, so it outlives the cancel.
+        yield {
+          type: "tool_progress",
+          tool_use_id: "toolu_sub",
+          tool_name: "Bash",
+          parent_tool_use_id: "toolu_parent",
+          elapsed_time_seconds: 3,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield successResult();
+      })(),
+    );
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    await vi.waitFor(() =>
+      expect(updates.map(({ update }) => update.sessionUpdate)).toContain("subagent_spawned"),
+    );
+    await agent.canUseTool("test-session")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_sub",
+      agentID: "agent-42",
+    } as any);
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(turn).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    // AIR's draft ends the child at the cancel, and an ended child gets no
+    // more updates.
+    const childEvents = updates.flatMap(({ sessionId, update }) =>
+      update.sessionUpdate === "subagent_state_update"
+        ? [`subagent ${update.state}`]
+        : (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+            update.toolCallId === "toolu_sub"
+          ? [`${update.sessionUpdate} ${update.status ?? ""} ${sessionId}`]
+          : [],
+    );
+    expect(childEvents).toEqual(["tool_call pending agent-42", "subagent cancelled"]);
+  });
+
   it("routes a native child AskUserQuestion and its tool call to the child session", async () => {
     const { agent, updates, elicitations, session } = setup();
     await agent.initialize({
@@ -16269,7 +16339,7 @@ describe("post-error recovery", () => {
     expect(agent.sessions["test-session"].abortController.signal.aborted).toBe(false);
   });
 
-  it("still interrupts when native subagent cancellation publication fails, and keeps each tool call's session", async () => {
+  it("still interrupts and cleans up when native subagent cancellation publication fails", async () => {
     const errors: unknown[][] = [];
     const agent = new ClaudeAcpAgent({} as AcpClient, {
       log: () => {},
@@ -16281,7 +16351,7 @@ describe("post-error recovery", () => {
     });
     const session = mockSessionState({
       query: wrapQuery(emptyQuery()),
-      nativeSubagentRuntime: { parentCancelled } as unknown as NativeSubagentRuntime,
+      nativeSubagentRuntime: { form: "air", parentCancelled } as unknown as NativeSubagentRuntime,
       eagerToolCallSessions: new Map([["tool", "test-session"]]),
     });
     agent.sessions["test-session"] = session;
@@ -16290,9 +16360,7 @@ describe("post-error recovery", () => {
 
     expect(parentCancelled).toHaveBeenCalledOnce();
     expect(session.query.interrupt).toHaveBeenCalledOnce();
-    // A background subagent's tool call can outlive the cancel, and stays in
-    // the session where it was emitted.
-    expect(session.eagerToolCallSessions).toEqual(new Map([["tool", "test-session"]]));
+    expect(session.eagerToolCallSessions).toEqual(new Map());
     expect(errors.flat().join(" ")).toContain("failed to publish cancelled subagent state");
   });
 
