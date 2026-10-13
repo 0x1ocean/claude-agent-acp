@@ -1,4 +1,4 @@
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import { RequestError, type SessionNotification } from "@agentclientprotocol/sdk";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
 
@@ -929,10 +929,10 @@ function isWorking(child: NativeSubagent): boolean {
 /**
  * The RFD form: the work state at the end of a child's work.
  *
- * A failure has no stop reason yet: the RFD's `error` stop reason, with its
- * JSON-RPC `error`, is newer than SDK 1.7.0's v1 schema, whose `StopReason`
- * is closed. Until the SDK has it, the failure goes in
- * `_meta.claudeCode.error`, as the v2 surface does for a failed turn.
+ * A failure is idle with the `error` stop reason and, when the SDK gives its
+ * text, the JSON-RPC `error`, as the RFD asks: a v1 child has no prompt
+ * response, so this is how a client learns that its work failed. The error is
+ * an internal error, as for a failed turn on the v2 surface.
  *
  * A task that a worker restart orphaned, or that was still running when the
  * stream ended, is idle with no stop reason: its work ended, but the adapter
@@ -948,8 +948,9 @@ function rfdEndState(state: SubagentState, end: TaskEnd | undefined): WorkState 
     case "failed":
       return {
         state: "idle",
+        stopReason: "error",
         ...(end?.error
-          ? { _meta: { claudeCode: { error: { code: -32603, message: end.error } } } }
+          ? { error: { code: RequestError.internalError().code, message: end.error } }
           : {}),
       };
     default:

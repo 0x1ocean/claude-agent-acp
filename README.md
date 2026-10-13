@@ -43,9 +43,9 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
 - `subagent_update` on the parent announces the child before any of its traffic, with the
   parent's `title` and `description` for it, and reports its work state: `running`,
   `requires_action` while one of its requests is open, and `idle` when its work ends, with
-  `end_turn` or `cancelled` when the SDK gives the reason. A failure is `idle` with the SDK's
-  error in `_meta.claudeCode.error`, until the SDK has the RFD's `error` stop reason. The child
-  keeps its session for every delegation to it.
+  `end_turn` or `cancelled` when the SDK gives the reason. A failure is `idle` with the `error`
+  stop reason and the SDK's error text as its `error`. The child keeps its session for every
+  delegation to it.
 - The prompt of the Agent or Task call that launches the child, and the message of each
   SendMessage call that resumes it, is a `session_message` in the child's transcript. The tool
   call stays a tool call of the session that made it.

@@ -6101,7 +6101,8 @@ describe("subagent permission attribution (issue #851)", () => {
         sessionId: "agent-42",
         state: {
           state: "idle",
-          _meta: { claudeCode: { error: { code: -32603, message: "Context too small" } } },
+          stopReason: "error",
+          error: { code: -32603, message: "Context too small" },
         },
       });
     });
@@ -6425,13 +6426,18 @@ describe("subagent permission attribution (issue #851)", () => {
           .slice(-2)
           .map(({ update }) => update),
       ).toEqual([
-        { sessionUpdate: "subagent_update", sessionId: "agent-42", state: { state: "idle" } },
+        {
+          sessionUpdate: "subagent_update",
+          sessionId: "agent-42",
+          state: { state: "idle", stopReason: "error" },
+        },
         {
           sessionUpdate: "subagent_update",
           sessionId: "agent-42",
           state: {
             state: "idle",
-            _meta: { claudeCode: { error: { code: -32603, message: "Context too small" } } },
+            stopReason: "error",
+            error: { code: -32603, message: "Context too small" },
           },
         },
       ]);

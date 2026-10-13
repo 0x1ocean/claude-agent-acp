@@ -957,7 +957,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       { state: "running" },
       { state: "idle", stopReason: "end_turn" },
       { state: "running" },
-      { state: "idle" },
+      { state: "idle", stopReason: "error" },
     ]);
   });
 
