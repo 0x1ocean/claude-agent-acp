@@ -284,9 +284,11 @@ import {
 } from "./utils.js";
 import {
   acceptedPlanToolResult,
+  approvedPlan,
   ExitPlanCoordinator,
   isExitPlanInterruptionResult,
   observeExitPlanToolResults,
+  planModeUpdate,
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
@@ -2632,6 +2634,7 @@ export class ClaudeAcpAgent {
       },
       applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
       sessionUpdate: (notification) => this.client.sessionUpdate(notification),
+      supportsPlanOperations: () => this.clientCapabilities?.plan != null,
       ensureConsumer: (session, id) => this.ensureConsumer(session, id),
       logError: (message, error) => this.logger.error(message, error),
       destroyReplacement: (id, session) => {
@@ -11834,6 +11837,8 @@ export function toAcpNotifications(
     let update: SessionNotification["update"] | null = null;
     // The tool call that this chunk finishes, if it is a tool result.
     let finishedToolCallId: string | undefined;
+    // The plan that this chunk approves, if it is an ExitPlanMode result.
+    let approvedPlanUpdate: SessionNotification["update"] | undefined;
     switch (chunk.type) {
       case "text":
       case "text_delta": {
@@ -12101,6 +12106,20 @@ export function toAcpNotifications(
             }
             output.push({ sessionId, update: outputUpdate });
           }
+          // An approved plan of the main conversation becomes the session's
+          // markdown plan, after the tool call's result. An approval that
+          // clears the context ends the tool with an error result instead, and
+          // the restart into the fresh context publishes that plan (see
+          // ExitPlanCoordinator.restart).
+          if (
+            toolUse.name === "ExitPlanMode" &&
+            options?.clientCapabilities?.plan &&
+            !options.parentToolUseId &&
+            !("is_error" in chunk && chunk.is_error)
+          ) {
+            const plan = approvedPlan(toolUse.input, toolUseResult);
+            if (plan) approvedPlanUpdate = planModeUpdate(plan);
+          }
           update = finalUpdate;
         }
         // The tool_use is fully resolved now — drop it so a long session doesn't
@@ -12143,6 +12162,7 @@ export function toAcpNotifications(
         output.push({ sessionId, update });
       }
     }
+    if (approvedPlanUpdate) output.push({ sessionId, update: approvedPlanUpdate });
     if (finishedToolCallId !== undefined) {
       // The PostToolUse hook can still send the final diff, so the fields
       // stay tracked until its callback leaves the registry.
