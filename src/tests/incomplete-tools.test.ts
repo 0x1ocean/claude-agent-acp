@@ -9,6 +9,18 @@ import {
   wrapQuery,
 } from "./session-doubles.js";
 
+// The agent reads the CLI's auth status on each prompt. Answer it, so that the
+// tests checking `logError` don't see "claude auth status failed". The answer
+// makes the agent send an auth status `extNotification`; the client stubs it.
+vi.mock("node:child_process", async () => ({
+  ...(await vi.importActual<typeof import("node:child_process")>("node:child_process")),
+  execFile: (...args: unknown[]) =>
+    (args[args.length - 1] as (...values: unknown[]) => void)(null, {
+      stdout: JSON.stringify({ loggedIn: false, authMethod: "none", apiProvider: "firstParty" }),
+      stderr: "",
+    }),
+}));
+
 const sessionId = "test-session";
 const toolCallId = "unfinished-bash";
 
@@ -135,6 +147,340 @@ describe("incomplete foreground tools", () => {
     expect(failedTool()).toHaveLength(1);
     await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
     expect(failedTool()).toHaveLength(1);
+  });
+
+  it.each(["deferred", "checkpoint"] as const)(
+    "terminates unfinished tools when cancel settles a %s turn inline",
+    async (settlement) => {
+      let releaseStream!: () => void;
+      const streamGate = new Promise<void>((resolve) => (releaseStream = resolve));
+      const { agent, prompt, updates, logError } = createTestSession(async function* (input) {
+        yield* echoNextPrompt(input);
+        if (settlement === "deferred") {
+          yield toolStart();
+          yield toolUse();
+          yield toolStart("second-tool");
+          yield toolUse("second-tool");
+          yield toolStart("completed-tool");
+          yield toolResult("completed-tool");
+          // A background subagent holds the turn open, and its command runs on.
+          yield toolStart("bg-agent", null, "Agent");
+          yield toolUse("bg-agent", null, "Agent", { description: "Work", prompt: "Work" });
+          yield taskStarted("agent-bg", "bg-agent", "general-purpose", true);
+          yield toolResult("bg-agent");
+          yield toolStart("bg-child", "bg-agent");
+          yield toolUse("bg-child", "bg-agent");
+        }
+        yield successfulResultMessage();
+        await streamGate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        yield* echoNextPrompt(input);
+        yield successfulResultMessage();
+      });
+      if (settlement === "checkpoint") {
+        agent.sessions[sessionId].fileChangeReporter = {
+          request: vi.fn(),
+          report: vi.fn(() => streamGate),
+          finish: vi.fn(),
+        } as any;
+      }
+
+      try {
+        const first = prompt();
+        await vi.waitFor(() => {
+          const active = agent.sessions[sessionId].activeTurn;
+          expect(
+            settlement === "deferred" ? active?.deferredSettle : active?.settlingOutcome,
+          ).toBeDefined();
+        });
+        if (settlement === "checkpoint") {
+          for (const id of [toolCallId, "second-tool"]) {
+            await agent.canUseTool(sessionId)("Bash", { command: "echo test" }, {
+              toolUseID: id,
+              signal: new AbortController().signal,
+              suggestions: [],
+            } as any);
+          }
+        }
+        const active = agent.sessions[sessionId].activeTurn!;
+        const pendingOutcome = active.deferredSettle ?? active.settlingOutcome!;
+        await agent.cancel({ sessionId });
+        await expect(first).resolves.toEqual({
+          ...pendingOutcome,
+          stopReason: "cancelled",
+        });
+        for (const id of [toolCallId, "second-tool"]) {
+          const terminals = updates.filter((u) => u.toolCallId === id && u.status === "failed");
+          expect(terminals).toHaveLength(1);
+          expect(terminals[0].content[0].content.text).toContain("cancelled");
+          expect(agent.sessions[sessionId].emittedToolCalls.has(id)).toBe(false);
+          expect(agent.sessions[sessionId].toolUseCache).not.toHaveProperty(id);
+          expect(agent.sessions[sessionId].dispatchedToolCalls?.has(id)).not.toBe(true);
+          expect(hasHookCallback(id)).toBe(false);
+        }
+        expect(
+          updates.some((u) => u.toolCallId === "completed-tool" && u.status === "failed"),
+        ).toBe(false);
+        if (settlement === "deferred") {
+          // The cancel did not stop the background subagent, so its command stays open.
+          expect(updates.some((u) => u.toolCallId === "bg-child" && u.status === "failed")).toBe(
+            false,
+          );
+          expect(agent.sessions[sessionId].emittedToolCalls.has("bg-child")).toBe(true);
+        }
+        await agent.cancel({ sessionId });
+        releaseStream();
+        await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(updates.filter((u) => u.status === "failed")).toHaveLength(2);
+        expect(logError).not.toHaveBeenCalled();
+        await agent.sessions[sessionId].consumer;
+      } finally {
+        releaseStream();
+      }
+    },
+  );
+
+  it.each(["overlapping", "simultaneous"] as const)(
+    "does not duplicate tool terminals with %s cancellations",
+    async (ordering) => {
+      let releaseStream!: () => void;
+      const streamGate = new Promise<void>((resolve) => (releaseStream = resolve));
+      let releasePublication!: () => void;
+      const publicationGate = new Promise<void>((resolve) => (releasePublication = resolve));
+      let firstPublished!: () => void;
+      const publicationStarted = new Promise<void>((resolve) => (firstPublished = resolve));
+      const { agent, prompt, updates } = createTestSession(async function* (input) {
+        yield* echoNextPrompt(input);
+        yield toolStart();
+        yield toolStart("second-tool");
+        yield {
+          type: "system",
+          subtype: "task_started",
+          session_id: sessionId,
+          task_id: "child",
+          tool_use_id: "parent-agent",
+          subagent_type: "Explore",
+          description: "investigate",
+        };
+        yield successfulResultMessage();
+        await streamGate;
+      });
+      const publish = agent.client.sessionUpdate.bind(agent.client);
+      agent.client.sessionUpdate = async (notification) => {
+        await publish(notification);
+        const update = notification.update;
+        if (
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === toolCallId &&
+          update.status === "failed"
+        ) {
+          firstPublished();
+          await publicationGate;
+        }
+      };
+
+      try {
+        const first = prompt();
+        await vi.waitFor(() => {
+          expect(agent.sessions[sessionId].activeTurn?.deferredSettle).toBeDefined();
+        });
+        if (ordering === "simultaneous") {
+          const cancel = Promise.all([agent.cancel({ sessionId }), agent.cancel({ sessionId })]);
+          await publicationStarted;
+          releasePublication();
+          await cancel;
+        } else {
+          const cancel = agent.cancel({ sessionId });
+          await publicationStarted;
+          await agent.cancel({ sessionId });
+          releasePublication();
+          await cancel;
+        }
+        await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+        for (const id of [toolCallId, "second-tool"]) {
+          expect(updates.filter((u) => u.toolCallId === id && u.status === "failed")).toHaveLength(
+            1,
+          );
+        }
+        expect(agent.sessions[sessionId].emittedToolCalls.size).toBe(0);
+        releaseStream();
+        await agent.sessions[sessionId].consumer;
+      } finally {
+        releasePublication();
+        releaseStream();
+      }
+    },
+  );
+
+  it("still interrupts the SDK when inline tool terminal publication fails", async () => {
+    let releaseCheckpoint!: () => void;
+    const checkpointGate = new Promise<void>((resolve) => (releaseCheckpoint = resolve));
+    const { agent, prompt, logError } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield successfulResultMessage();
+    });
+    agent.sessions[sessionId].fileChangeReporter = {
+      request: vi.fn(),
+      report: vi.fn(() => checkpointGate),
+      finish: vi.fn(),
+    } as any;
+    const publish = agent.client.sessionUpdate.bind(agent.client);
+    const error = new Error("terminal publication failed");
+    agent.client.sessionUpdate = async (notification) => {
+      const update = notification.update;
+      if (update.sessionUpdate === "tool_call_update" && update.status === "failed") {
+        throw error;
+      }
+      await publish(notification);
+    };
+    try {
+      const first = prompt();
+      await vi.waitFor(() => {
+        expect(agent.sessions[sessionId].activeTurn?.settlingOutcome).toBeDefined();
+      });
+      await agent.canUseTool(sessionId)("Bash", { command: "echo test" }, {
+        toolUseID: toolCallId,
+        signal: new AbortController().signal,
+        suggestions: [],
+      } as any);
+      await expect(agent.cancel({ sessionId })).resolves.toBeUndefined();
+      await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+      expect(agent.sessions[sessionId].query.interrupt).toHaveBeenCalledTimes(1);
+      expect(logError).toHaveBeenCalledExactlyOnceWith(
+        `Session ${sessionId}: failed to publish cancelled tool state`,
+        error,
+      );
+      releaseCheckpoint();
+      await agent.sessions[sessionId].consumer;
+    } finally {
+      releaseCheckpoint();
+    }
+  });
+
+  it("keeps cancellation authoritative when a checkpoint finishes during tool cleanup", async () => {
+    let releaseCheckpoint!: () => void;
+    const checkpointGate = new Promise<void>((resolve) => (releaseCheckpoint = resolve));
+    let checkpointDrained!: () => void;
+    const consumerAdvanced = new Promise<void>((resolve) => (checkpointDrained = resolve));
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => (releaseStream = resolve));
+    let releasePublication!: () => void;
+    const publicationGate = new Promise<void>((resolve) => (releasePublication = resolve));
+    let firstPublished!: () => void;
+    const publicationStarted = new Promise<void>((resolve) => (firstPublished = resolve));
+    const { agent, prompt } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield successfulResultMessage();
+      checkpointDrained();
+      await streamGate;
+    });
+    agent.sessions[sessionId].fileChangeReporter = {
+      request: vi.fn(),
+      report: vi.fn(() => checkpointGate),
+      finish: vi.fn(),
+    } as any;
+    const publish = agent.client.sessionUpdate.bind(agent.client);
+    agent.client.sessionUpdate = async (notification) => {
+      await publish(notification);
+      const update = notification.update;
+      if (
+        update.sessionUpdate === "tool_call_update" &&
+        update.toolCallId === toolCallId &&
+        update.status === "failed"
+      ) {
+        firstPublished();
+        await publicationGate;
+      }
+    };
+
+    try {
+      let responded = false;
+      const first = prompt().then((response) => {
+        responded = true;
+        return response;
+      });
+      await vi.waitFor(() => {
+        expect(agent.sessions[sessionId].activeTurn?.settlingOutcome).toBeDefined();
+      });
+      await agent.canUseTool(sessionId)("Bash", { command: "echo test" }, {
+        toolUseID: toolCallId,
+        signal: new AbortController().signal,
+        suggestions: [],
+      } as any);
+      const cancel = agent.cancel({ sessionId });
+      await publicationStarted;
+      releaseCheckpoint();
+      await consumerAdvanced;
+      expect(responded).toBe(false);
+      releasePublication();
+      await cancel;
+      await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+      releaseStream();
+      await agent.sessions[sessionId].consumer;
+    } finally {
+      releaseCheckpoint();
+      releasePublication();
+      releaseStream();
+    }
+  });
+
+  it("closes each tool call once, before the response, when a cancel settles a held turn that the consumer is closing", async () => {
+    let releasePublication!: () => void;
+    const publicationGate = new Promise<void>((resolve) => (releasePublication = resolve));
+    let firstHeld!: () => void;
+    const publicationHeld = new Promise<void>((resolve) => (firstHeld = resolve));
+    const { agent, prompt, updates, logError } = createTestSession(async function* (input, agent) {
+      yield* echoNextPrompt(input);
+      // A background subagent holds the turn open after its result.
+      yield toolStart("bg-agent", null, "Agent");
+      yield toolUse("bg-agent", null, "Agent", { description: "Work", prompt: "Work" });
+      yield taskStarted("agent-bg", "bg-agent", "general-purpose", true);
+      yield toolResult("bg-agent");
+      yield successfulResultMessage();
+      // The first cancel lands while a follow-up cycle runs two commands, so it
+      // leaves the turn to the consumer, which settles it at the idle.
+      yield { type: "system", subtype: "session_state_changed", state: "running" };
+      yield toolStart();
+      yield toolUse();
+      yield toolStart("second-tool");
+      yield toolUse("second-tool");
+      await agent.cancel({ sessionId });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
+    const events: string[] = [];
+    const publish = agent.client.sessionUpdate.bind(agent.client);
+    agent.client.sessionUpdate = async (notification) => {
+      const update = notification.update;
+      if (update.sessionUpdate === "tool_call_update" && update.status === "failed") {
+        if (update.toolCallId === toolCallId) {
+          firstHeld();
+          await publicationGate;
+        }
+        events.push(`end ${update.toolCallId}`);
+      }
+      await publish(notification);
+    };
+
+    try {
+      const response = prompt().then((outcome) => {
+        events.push("response");
+        return outcome;
+      });
+      await publicationHeld;
+      // The session now reads idle, so the second cancel settles the held turn
+      // itself, while the consumer's first report is in flight.
+      const cancel = agent.cancel({ sessionId });
+      await vi.waitFor(() => expect(agent.sessions[sessionId].activeTurn).toBeNull());
+      releasePublication();
+      await cancel;
+      await expect(response).resolves.toMatchObject({ stopReason: "cancelled" });
+      expect(events).toEqual([`end ${toolCallId}`, "end second-tool", "response"]);
+      expect(logError).not.toHaveBeenCalled();
+      await agent.sessions[sessionId].consumer;
+      expect(updates.filter((u) => u.status === "failed")).toHaveLength(2);
+    } finally {
+      releasePublication();
+    }
   });
 
   it("closes a streamed tool_use that never reached a complete message without a failure", async () => {
@@ -409,6 +755,7 @@ function createTestSession(
         updates.push(notification.update);
       },
       requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow-once" } }),
+      extNotification: async () => {},
     } as unknown as AcpClient,
     { log: () => {}, error: logError },
   );

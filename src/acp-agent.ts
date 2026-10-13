@@ -683,6 +683,11 @@ type Turn = {
    *  background handoff. Intersect with emittedToolCalls at settlement so
    *  tool_result counts even when a presentation hook is still pending. */
   foregroundToolCallIds?: Set<string>;
+  /** Closes the tool calls this turn left open when a cancel ended it. Both
+   *  the consumer and `cancelTurns` can settle a cancelled turn; they share
+   *  this one closing, so each call gets one report and both wait for all of
+   *  them before reporting the cancel. */
+  closingCancelledToolCalls?: Promise<void>;
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -1263,6 +1268,9 @@ export type Session = {
   nativeSubagentRuntime?: NativeSubagentRuntime;
   /** Child-aware delivery closure paired with {@link nativeSubagentRuntime}. */
   nativeSubagentDeliver?: (notification: AcpSessionNotification) => Promise<void>;
+  /** The consumer's `closeCancelledToolCalls`, for `cancelTurns`, which settles
+   *  a held or settling turn itself. */
+  closeCancelledToolCalls?: (turn: Turn) => Promise<void>;
   /** Session-owned async task controller. Prompt cancellation intentionally
    *  does not finish it because background work may outlive a prompt. */
   asyncTaskRuntime?: AsyncTaskRuntime;
@@ -4889,25 +4897,26 @@ export class ClaudeAcpAgent {
      *  subagent keeps its tool calls open until the SDK reports its end, which
      *  Claude Code 2.1.293 does for the ones it stops, before the turn's result
      *  (see `NativeSubagentRuntime.parentCancelled`).
-     *  Returns false when the turn ended meanwhile. */
-    const closeCancelledToolCalls = async (turn: Turn): Promise<boolean> => {
-      const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
-      for (const toolCallId of [...session.emittedToolCalls]) {
-        const parentToolUseId = session.toolCallParents?.get(toolCallId);
-        if (parentToolUseId !== undefined && runsInBackground(parentToolUseId)) continue;
-        const report = renderer.unfinished({
-          toolCallId,
-          ran: session.dispatchedToolCalls?.has(toolCallId) === true,
-          cancelled: true,
-        });
-        // Named as the call's other updates are: the subagent runtime routes the
-        // report with them, to the child session, or to none that has ended.
-        if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
-        await closeToolCall(toolCallId, report);
-        if (turn.settled || session.activeTurn !== turn) return false;
-      }
-      return true;
-    };
+     *  Runs once per turn: a second call, from the other settling path, waits
+     *  for the first (see `Turn.closingCancelledToolCalls`). */
+    const closeCancelledToolCalls = (turn: Turn): Promise<void> =>
+      (turn.closingCancelledToolCalls ??= (async () => {
+        const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+        for (const toolCallId of [...session.emittedToolCalls]) {
+          const parentToolUseId = session.toolCallParents?.get(toolCallId);
+          if (parentToolUseId !== undefined && runsInBackground(parentToolUseId)) continue;
+          const report = renderer.unfinished({
+            toolCallId,
+            ran: session.dispatchedToolCalls?.has(toolCallId) === true,
+            cancelled: true,
+          });
+          // Named as the call's other updates are: the subagent runtime routes the
+          // report with them, to the child session, or to none that has ended.
+          if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
+          await closeToolCall(toolCallId, report);
+        }
+      })());
+    session.closeCancelledToolCalls = closeCancelledToolCalls;
 
     /** Delivers the results that the work a cancel stopped sends for tool calls
      *  that the client holds open. Claude Code's interrupt ends each running tool
@@ -5025,7 +5034,9 @@ export class ClaudeAcpAgent {
       // response on v1, `idle` on v2) only after every tool call that work
       // opened has ended.
       if (result.stopReason === "cancelled" && session.cancelled) {
-        if (!(await closeCancelledToolCalls(turn))) return;
+        await closeCancelledToolCalls(turn);
+        // `cancelTurns` can settle the turn while the reports are in flight.
+        if (turn.settled || session.activeTurn !== turn) return;
       }
       turn.settling = true;
       turn.settlingOutcome = result;
@@ -8037,7 +8048,8 @@ export class ClaudeAcpAgent {
     // permission request) is left to that cycle's interrupted result, like any
     // live turn, or to the idle when no result comes. The captured outcome
     // preserves usage and metadata (issue #844), while reporter state makes a
-    // late checkpoint response harmless.
+    // late checkpoint response harmless. The turn's open tool calls close
+    // before its response, as in the consumer's settle.
     // Since CLI 2.1.270, Claude Code reports `running` for as long as
     // background agents live, so the session state cannot tell a live
     // followup from a hold. With request markers, a followup is live when one
@@ -8052,7 +8064,10 @@ export class ClaudeAcpAgent {
         (active.settling || (isHeldOpen(active) && !followupLive)) &&
         (active.deferredSettle ?? active.settlingOutcome)
       ) {
+        const closingToolCalls = session.closeCancelledToolCalls?.(active);
         session.fileChangeReporter?.finish(active.fileChangeReport, "cancelled");
+        // Settled before the reports are awaited, so that the consumer, which
+        // keeps running meanwhile, cannot settle the turn a second time.
         active.settled = true;
         // Mirror settleActive's invariants (it is consumer-scoped and
         // unreachable from here): disarm the backstop — none should be
@@ -8084,7 +8099,16 @@ export class ClaudeAcpAgent {
         if (session.lastSessionState !== "idle") {
           session.owedTrailingIdles++;
         }
-        active.resolve(cancelledOutcome(session, active));
+        try {
+          await closingToolCalls;
+        } catch (error) {
+          this.logger.error(
+            `Session ${params.sessionId}: failed to publish cancelled tool state`,
+            error,
+          );
+        } finally {
+          active.resolve(cancelledOutcome(session, active));
+        }
       }
     }
 
