@@ -42,7 +42,8 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
 
 - `subagent_update` on the parent announces the child before any of its traffic, with the
   parent's `title` and `description` for it, and reports its work state: `running`,
-  `requires_action` while one of its requests is open, and `idle` when its work ends, with
+  `requires_action` while one of its requests is open (and `running` again when the last one ends,
+  unless a cancel withdrew it: the child is stopping then), and `idle` when its work ends, with
   `end_turn` or `cancelled` when the SDK gives the reason. A failure is `idle` with the `error`
   stop reason and the SDK's error text as its `error`. The child keeps its session for every
   delegation to it.
