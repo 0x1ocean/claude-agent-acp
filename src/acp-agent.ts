@@ -5010,6 +5010,19 @@ export class ClaudeAcpAgent {
       }
     };
 
+    /** A cancel stopped the model cycle that Claude Code started on its own, and
+     *  its end is about to be reported: closes the tool calls that it left open
+     *  first. A cycle is foreground work that no turn settles, so
+     *  `closeCancelledToolCalls` does not run for it. Claude Code's interrupt
+     *  gives the tools of the main conversation results, which
+     *  `sendInterruptedToolResults` delivers while the cycle runs. What is still
+     *  open has none, such as the command of a foreground subagent. A turn that
+     *  took the cycle over closes its own calls, when it settles. */
+    const closeCancelledCycleToolCalls = async (): Promise<void> => {
+      if (!session.cancelled || !this.runsAutonomousCycle(params.sessionId)) return;
+      await closeOpenToolCalls(closedAtCancel);
+    };
+
     /** At the actual turn boundary, preview its checkpoint, settle the active
      *  turn exactly once, disarm the force-cancel backstop, and drop it from
      *  the queue. Cancellation and provider failures skip checkpoint I/O. */
@@ -5716,6 +5729,7 @@ export class ClaudeAcpAgent {
                   // here. An owed idle belongs to an earlier result: it can lag
                   // past the cycle's first output.
                   if (session.owedTrailingIdles === 0) {
+                    await closeCancelledCycleToolCalls();
                     this.endAutonomousCycle(params.sessionId, {
                       outcome: { stopReason: session.cancelled ? "cancelled" : "end_turn" },
                     });
@@ -6632,6 +6646,7 @@ export class ClaudeAcpAgent {
                 pendingExitPlanContextReset?.toolUseId ===
                   pendingExitPlanModeInterruption?.toolUseId;
               if (!continuesPlan && !(isAutonomousResult && message.num_turns === 0)) {
+                await closeCancelledCycleToolCalls();
                 this.endAutonomousCycle(
                   params.sessionId,
                   autonomousCycleEnd(
@@ -9205,6 +9220,13 @@ export class ClaudeAcpAgent {
     end: { outcome: TurnOutcome } | { error: unknown },
   ): void {
     this.endForeground(sessionId, AUTONOMOUS_CYCLE, end);
+  }
+
+  /** Whether a model cycle that Claude Code started on its own is the session's
+   *  foreground work. Only a client that gets the session's work reported (v2)
+   *  has any; a turn that took a cycle over owns the work from then on. */
+  private runsAutonomousCycle(sessionId: string): boolean {
+    return this.foregroundWork.get(sessionId)?.owner === AUTONOMOUS_CYCLE;
   }
 
   /** Forward a permission request to the client, wiring the tool call's
