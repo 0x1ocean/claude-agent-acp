@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.91.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.90.0...v0.91.0) (2026-10-14)
+
+
+### Features
+
+* keep background subagents running after a parent cancel, for clients that can cancel them ([#1348](https://github.com/agentclientprotocol/claude-agent-acp/issues/1348)) ([ba3c7be](https://github.com/agentclientprotocol/claude-agent-acp/commit/ba3c7be05e9af297fe95b0ac647da2340dd9e15b))
+* let a client cancel one subagent with session/cancel on its child session ([#1347](https://github.com/agentclientprotocol/claude-agent-acp/issues/1347)) ([aeb69e7](https://github.com/agentclientprotocol/claude-agent-acp/commit/aeb69e7ed1170e8bce236378432ef8b83cdf2554))
+* narrow models to what the providers/set gateway lists ([#1340](https://github.com/agentclientprotocol/claude-agent-acp/issues/1340)) ([e8eb9d3](https://github.com/agentclientprotocol/claude-agent-acp/commit/e8eb9d340fd4f6dfd9826cf58461edf5ee165f44))
+* restore a subagent from before a reload when SendMessage resumes it, for subagents RFD clients ([#1332](https://github.com/agentclientprotocol/claude-agent-acp/issues/1332)) ([df21b3f](https://github.com/agentclientprotocol/claude-agent-acp/commit/df21b3fb56c3449b6f86c9c9df558be351815ed3))
+
+
+### Bug Fixes
+
+* close the tool calls of a background subagent that the SDK reports stopped after a cancel ([#1336](https://github.com/agentclientprotocol/claude-agent-acp/issues/1336)) ([9a1b90f](https://github.com/agentclientprotocol/claude-agent-acp/commit/9a1b90fb9db8b04ef6756cbcdc8df22afc82a2ba))
+* close the tool calls of a cycle that Claude Code started and a cancel stopped ([#1339](https://github.com/agentclientprotocol/claude-agent-acp/issues/1339)) ([1fd217f](https://github.com/agentclientprotocol/claude-agent-acp/commit/1fd217f3e77d0b7883ebd220bc19c7899d3af77f))
+* close the tool calls that a cycle Claude Code started abandoned, at its end ([#1344](https://github.com/agentclientprotocol/claude-agent-acp/issues/1344)) ([594aa8c](https://github.com/agentclientprotocol/claude-agent-acp/commit/594aa8c9556609c16946c889e9c8f1f76337b203))
+* deliver the output of a background subagent that a cancel did not stop ([#1345](https://github.com/agentclientprotocol/claude-agent-acp/issues/1345)) ([bcc024d](https://github.com/agentclientprotocol/claude-agent-acp/commit/bcc024d2c9a34d62e19999bc6cfc393ad56fbcde))
+* end the terminal of a command whose tool call is closed without a result ([#1335](https://github.com/agentclientprotocol/claude-agent-acp/issues/1335)) ([764f339](https://github.com/agentclientprotocol/claude-agent-acp/commit/764f339c3e83eac8ca34f4ddc8ed65f8199b651d))
+* end the tool calls of a cycle that Claude Code started and a cancel stopped, on v1 ([#1342](https://github.com/agentclientprotocol/claude-agent-acp/issues/1342)) ([b4788d6](https://github.com/agentclientprotocol/claude-agent-acp/commit/b4788d61eaf9372b376d56c0f6fb7c6156822ae6))
+* report no running for the session's own request that a cancel withdraws, on ACP v2 ([#1346](https://github.com/agentclientprotocol/claude-agent-acp/issues/1346)) ([d528647](https://github.com/agentclientprotocol/claude-agent-acp/commit/d528647162ba6747654125cf6ebc2297ced02ed0))
+* show nothing of a tool that cancelled work asks to run after the cancel was reported ([#1334](https://github.com/agentclientprotocol/claude-agent-acp/issues/1334)) ([ebf8b49](https://github.com/agentclientprotocol/claude-agent-acp/commit/ebf8b49fd68924f2c50680e7e73241f625801980))
+* stop waiting for a question the client leaves open after Claude Code cancels it ([#1338](https://github.com/agentclientprotocol/claude-agent-acp/issues/1338)) ([c1e83b4](https://github.com/agentclientprotocol/claude-agent-acp/commit/c1e83b46b717230a5d623c3ac591d915a776e0ae))
+
 ## [0.90.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.89.1...v0.90.0) (2026-10-13)
 
 
